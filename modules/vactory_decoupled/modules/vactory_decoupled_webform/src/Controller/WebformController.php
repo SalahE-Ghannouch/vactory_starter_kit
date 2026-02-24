@@ -115,17 +115,11 @@ class WebformController extends ControllerBase {
       return new JsonResponse($error_message, $error_message['code'] ?? 400);
     }
     if (isset($webform_data['sid']) && !empty($webform_data['sid'])) {
-      $webform_submission = WebformSubmission::load($webform_data['sid']);
-      $webform_submission->setCurrentPage($webform_data['current_page'] ?? NULL);
-      $webform_submission->set('in_draft', $webform_data['in_draft'] == 'true');
-
-      foreach ($webform_data as $element => $data) {
-        if (!in_array($element, self::ELEMENT_TO_SKIP)) {
-          if (isset($data) && !empty($data)) {
-            $webform_submission->setElementData($element, $data);
-          }
-        }
+      $validation_result = $this->loadAndValidateSubmission($webform_data, $webform);
+      if ($validation_result instanceof JsonResponse) {
+        return $validation_result;
       }
+      $webform_submission = $validation_result;
     }
     else {
       // Convert to webform values format.
@@ -140,7 +134,7 @@ class WebformController extends ControllerBase {
         'remote_addr'  => $webform->hasRemoteAddr() ? $request->getClientIp() : '',
         'webform_id'   => $webform_data['webform_id'],
       ];
-      $values['data'] = $webform_data;
+      $values['data'] = $this->sanitizeArray($webform_data);
 
       // Don't submit webform ID.
       unset($values['data']['webform_id']);
@@ -160,12 +154,17 @@ class WebformController extends ControllerBase {
         $submission = WebformSubmission::load($webform_submission->id());
         $datalayer = $submission->get('datalayer')->value;
       }
-      return new JsonResponse([
-        'sid' => $webform_submission->id(),
-        'crypted_sid' => $this->vactoryDevTools->encrypt('vactory_tender' . $webform_submission->id()),
+
+      $response = [
         'settings' => self::getWhitelistedSettings($webform),
         'datalayer' => isset($datalayer) ? json_decode($datalayer, TRUE) : [],
-      ]);
+      ];
+
+      if ($this->currentUser->isAuthenticated()) {
+        $response['sid'] = $webform_submission->id();
+        $response['crypted_sid'] = $this->vactoryDevTools->encrypt('vactory_tender' . $webform_submission->id());
+      }
+      return new JsonResponse($response);
     }
     else {
       // Return validation errors.
@@ -173,6 +172,71 @@ class WebformController extends ControllerBase {
         'error' => $webform_submission,
       ], 400);
     }
+  }
+
+  /**
+   * Loads and validates an existing webform submission.
+   */
+  private function loadAndValidateSubmission(array $webform_data) {
+    $errorResponse = NULL;
+
+    $webform_submission = WebformSubmission::load($webform_data['sid']);
+
+    // Verify that the submission exists.
+    if (!$webform_submission) {
+      $errorResponse = new JsonResponse([
+        'error' => [
+          'code'    => '404',
+          'message' => 'Submission not found.',
+        ],
+      ], 404);
+    }
+
+    // Verify that the submission belongs to the correct webform.
+    if (!$errorResponse &&
+      $webform_submission->getWebform()->id() !== $webform_data['webform_id']) {
+      $errorResponse = new JsonResponse([
+        'error' => [
+          'code'    => '403',
+          'message' => 'Access denied: Submission does not belong to this webform.',
+        ],
+      ], 403);
+    }
+
+    // Verify that the user is the owner.
+    if (!$errorResponse) {
+      $submission_owner_id = $webform_submission->getOwnerId();
+      $current_user_id = $this->currentUser->id();
+
+      if ($this->currentUser->isAnonymous() ||
+        $submission_owner_id != $current_user_id) {
+        $errorResponse = new JsonResponse([
+          'error' => [
+            'code'    => '403',
+            'message' => 'Access denied: You do not have permission to modify this submission.',
+          ],
+        ], 403);
+      }
+    }
+
+    // Return error if any.
+    if ($errorResponse) {
+      return $errorResponse;
+    }
+
+    // Update submission data.
+    $webform_submission->setCurrentPage($webform_data['current_page'] ?? NULL);
+    $webform_submission->set('in_draft', $webform_data['in_draft'] == 'true');
+
+    foreach ($webform_data as $element => $data) {
+      if (!in_array($element, self::ELEMENT_TO_SKIP)) {
+        if (isset($data) && !empty($data)) {
+          $webform_submission->setElementData($element, $data);
+        }
+      }
+    }
+
+    return $webform_submission;
   }
 
   /**
@@ -255,6 +319,25 @@ class WebformController extends ControllerBase {
       }
     }
     return FALSE;
+  }
+
+  /**
+   * Nettoie récursivement un tableau de données utilisateur.
+   *
+   * @param array $data
+   *   Le tableau à nettoyer.
+   *
+   * @return array
+   *   Le tableau nettoyé.
+   */
+  private function sanitizeArray(array $data): array {
+    array_walk_recursive($data, function (&$value) {
+      if (is_string($value)) {
+        $value = strip_tags($value);
+      }
+    });
+
+    return $data;
   }
 
 }
